@@ -16,11 +16,12 @@ import uuid
 import sys
 import os
 from pathlib import Path
+import pandas as pd
 
 import broker
 
 class PriceStreamer:
-    def __init__(self, broker_name):
+    def __init__(self, broker_name, ttl=None):
         assert broker_name in ['oanda', 'ib', 'alpaca'], "Invalid broker name"
         self.broker_name = broker_name
         self.credentials = None
@@ -32,8 +33,20 @@ class PriceStreamer:
         # Add TTL configuration
         self.price_ttl = 2  # Default 2 seconds
         self.index_ttl = 10  # Default 10 seconds
+        # CLI override for TTL (if provided)
+        self.cli_ttl = ttl
         self.load_credentials()
         self.load_config()
+        # If CLI TTL provided, override config values to keep lifetime consistent
+        if self.cli_ttl is not None:
+            try:
+                ttl_val = int(self.cli_ttl)
+                self.price_ttl = ttl_val
+                self.index_ttl = ttl_val
+                # historical TTL should match overall TTL unless user specifies otherwise in config
+                self.hist_ttl = ttl_val
+            except Exception:
+                pass
         self.connect_to_redis()
         
     def load_credentials(self):
@@ -64,8 +77,11 @@ class PriceStreamer:
                 })
                 # Load TTL configuration
                 ttl_config = config.get('ttl', {})
-                self.price_ttl = ttl_config.get('price_data', 2)  # Default 2 seconds
+                # Default to 10 seconds for all messages per user request
+                self.price_ttl = ttl_config.get('price_data', 10)  # Default 10 seconds
                 self.index_ttl = ttl_config.get('price_index', 10)  # Default 10 seconds
+                # TTL for historical price messages (seconds). By default match live TTL
+                self.hist_ttl = ttl_config.get('historical_price_data', 10)
             print(f"✅ Loaded config: tracking {len(self.instruments)} instruments")
             print(f"📊 Instruments: {', '.join(self.instruments)}")
             print(f"⏱️ TTL - Price data: {self.price_ttl}s, Index: {self.index_ttl}s")
@@ -281,7 +297,7 @@ class PriceStreamer:
         except redis.ConnectionError:
             pass  # Skip cleanup if connection issues
 
-    def run(self):
+    def run(self, rows=5000, granularity='S5'):
         """Start the price streaming service."""
         print(f"🚀 Starting self-contained price streaming service...")
         
@@ -300,6 +316,13 @@ class PriceStreamer:
         except redis.ConnectionError as e:
             print(f"❌ Could not clear old price data: {e}")
         
+        # Load historical data for configured instruments before starting live stream
+        try:
+            # Request configured number of historical rows per instrument
+            self.load_historical_data(rows=rows, granularity=granularity)
+        except Exception as e:
+            print(f"⚠️ Could not load historical data: {e}")
+
         # Start price streaming
         price_thread = threading.Thread(target=self.run_price_stream, daemon=True)
         price_thread.start()
@@ -319,14 +342,156 @@ class PriceStreamer:
         except KeyboardInterrupt:
             print("\n🛑 Price streamer stopped by user")
 
+    def load_historical_data(self, rows=5000, granularity='S5'):
+        """Fetch recent historical data for configured instruments and publish to Redis.
+
+        It calls `broker.get_oanda_data` per instrument and writes each candle
+        as a short-lived price message into Redis so downstream consumers
+        immediately have recent context.
+        """
+        print(f"📥 Loading historical data: rows={rows}, granularity={granularity}")
+
+        for instrument in list(self.active_instruments):
+            print(f"📡 Fetching historical for {instrument}...")
+            try:
+                df = broker.get_oanda_data(self.credentials, instrument=instrument,
+                                           granularity=granularity, rows=rows)
+                if df is None or df.empty:
+                    print(f"⚠️ No historical data for {instrument}")
+                    continue
+
+                published = 0
+                for _, row in df.iterrows():
+                    # Use the DataFrame's timestamp and price/bid/ask columns returned by get_oanda_data
+                    ts_val = row['timestamp'] if 'timestamp' in row else None
+                    price = row['price'] if 'price' in row else None
+                    bid = row['bid'] if 'bid' in row else None
+                    ask = row['ask'] if 'ask' in row else None
+                    # Normalize price: convert pandas NA to None and ensure numeric
+                    if pd.isna(price):
+                        price = None
+                    else:
+                        try:
+                            price = float(price)
+                        except Exception:
+                            price = None
+
+                    # Coerce bid/ask/price to floats when possible, prefer explicit bid/ask
+                    def to_float_safe(x):
+                        try:
+                            if pd.isna(x):
+                                return None
+                            return float(x)
+                        except Exception:
+                            return None
+
+                    bid = to_float_safe(bid)
+                    ask = to_float_safe(ask)
+                    price = to_float_safe(price)
+
+                    # If explicit bid/ask are missing, fall back to mid/price
+                    if bid is None and price is not None:
+                        bid = price
+                    if ask is None and price is not None:
+                        ask = price
+
+                    spread_pips = None
+                    if bid is not None and ask is not None:
+                        spread_pips = round((ask - bid) * 10000, 1)
+
+                    # Prepare timestamp for storage (ISO) and for display (match live print)
+                    if ts_val is None or pd.isna(ts_val):
+                        ts_iso = str(ts_val)
+                        display_ts = str(ts_val)
+                    else:
+                        # ISO string for storage
+                        try:
+                            ts_iso = ts_val.isoformat() if hasattr(ts_val, 'isoformat') else str(ts_val)
+                        except Exception:
+                            ts_iso = str(ts_val)
+
+                        # Live printing uses datetime.__str__ (space-separated). Produce same display.
+                        try:
+                            if isinstance(ts_val, str):
+                                # Convert '2025-08-25T12:34:56' -> '2025-08-25 12:34:56'
+                                display_ts = ts_val.replace('T', ' ').replace('Z', '')
+                            else:
+                                display_ts = str(ts_val)
+                        except Exception:
+                            display_ts = str(ts_val)
+
+                    price_data = {
+                        'timestamp': ts_iso,
+                        'bid': bid,
+                        'ask': ask,
+                        'price': price,
+                        'spread_pips': spread_pips,
+                        'instrument': instrument
+                    }
+
+                    # Print historical data in the same format as live updates
+                    # Print using the same layout as live updates with formatting
+                    if price_data['bid'] is None:
+                        print(f"💰 {instrument}: <no-bid> at {display_ts}")
+                    else:
+                        try:
+                            print(f"💰 {instrument}: {price_data['bid']:.5f} at {display_ts}")
+                        except Exception:
+                            print(f"💰 {instrument}: {price_data['bid']} at {display_ts}")
+
+                    try:
+                        price_key = f"{self.price_key_prefix}{instrument}:{uuid.uuid4().hex[:8]}"
+                        # Use configured historical TTL (defaults to 10s)
+                        hist_ttl = self.hist_ttl
+
+                        # Debug: print exactly what we are about to publish to Redis
+                        try:
+                            publish_json = json.dumps(price_data, ensure_ascii=False)
+                        except Exception:
+                            publish_json = str(price_data)
+                        print(f"▶ PUBLISH -> {price_key} : {publish_json}")
+
+                        # Store the historical message
+                        self.redis_client.setex(price_key, hist_ttl, publish_json)
+
+                        # Verify the key exists before adding to the index to avoid
+                        # dangling set members that point to missing keys.
+                        try:
+                            stored = self.redis_client.get(price_key)
+                        except Exception:
+                            stored = None
+
+                        if stored is not None:
+                            self.redis_client.sadd(self.price_index_key, price_key)
+                            self.redis_client.expire(self.price_index_key, self.index_ttl)
+                            published += 1
+                            # Print a small sample for debugging
+                            try:
+                                stub = stored.decode('utf-8') if isinstance(stored, (bytes, bytearray)) else str(stored)
+                                print(f"🔍 Stored sample for {price_key}: {stub[:160]}")
+                            except Exception:
+                                pass
+                        else:
+                            print(f"❗ Stored value missing for {price_key} after SETEX (not indexing)")
+                    except redis.ConnectionError:
+                        print(f"❌ Lost Redis connection while publishing historical {instrument}")
+                        self.connect_to_redis()
+                        break
+
+                print(f"✅ Published {published} historical messages for {instrument}")
+            except Exception as e:
+                print(f"❌ Error fetching historical for {instrument}: {e}")
+
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Price Streamer')
     parser.add_argument('--broker', choices=['oanda', 'ib', 'alpaca'], 
                        default='oanda', help='Broker to use')
+    parser.add_argument('--rows', type=int, default=5000, help='Number of historical rows to fetch per instrument')
+    parser.add_argument('--ttl', type=int, default=10, help='TTL (seconds) for price messages and index (default 10)')
     
     args = parser.parse_args()
     
-    streamer = PriceStreamer(args.broker)
-    streamer.run()
+    streamer = PriceStreamer(args.broker, ttl=args.ttl)
+    streamer.run(rows=args.rows)

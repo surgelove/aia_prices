@@ -339,12 +339,13 @@ def get_oanda_data(credentials, instrument='USD_CAD', granularity='S5', hours=5,
     # API endpoint for historical candles
     url = f"{BASE_URL}/v3/instruments/{instrument}/candles"
     
-    # Parameters for the request
+    # Parameters for the request - explicitly ask for Bid+Ask series (BA)
     params = {
         'count': count,
-        'granularity': granularity#,
-        # 'price': 'MBA',  # Mid, Bid, Ask prices
-        # 'includeFirst': 'true'
+        'granularity': granularity,
+        # Request both Bid and Ask price series so we can return real bid/ask
+        'price': 'BA'
+        # Note: do not set 'includeFirst' unless using a 'from' timestamp on a candle boundary.
     }
     
     try:
@@ -379,6 +380,9 @@ def get_oanda_data(credentials, instrument='USD_CAD', granularity='S5', hours=5,
         
         # Parse JSON response
         data = response.json()
+        print('-----here')
+        print(data)
+
         
         if 'candles' not in data:
             print("❌ ERROR: No candles data in response")
@@ -398,22 +402,61 @@ def get_oanda_data(credentials, instrument='USD_CAD', granularity='S5', hours=5,
             # Remove timezone info (localize to None)
             timestamp = timestamp.tz_localize(None)
             
-            # Extract OHLC data
-            mid = candle.get('mid', {})
-            bid = candle.get('bid', {})
-            ask = candle.get('ask', {})
-            
-            if not mid:
-                continue  # Skip if no mid prices
-            
-            # Get prices
-            open_price = float(mid['o'])
-            high_price = float(mid['h'])
-            low_price = float(mid['l'])
-            close_price = float(mid['c'])
-            
-            bid_price = float(bid.get('c', close_price - 0.0001))
-            ask_price = float(ask.get('c', close_price + 0.0001))
+            # Extract OHLC data if available; OANDA may return 'mid', or only 'bid' and 'ask'.
+            mid = candle.get('mid')
+            bid = candle.get('bid')
+            ask = candle.get('ask')
+
+            # helper to safely parse floats
+            def sf(obj, key):
+                try:
+                    if obj is None:
+                        return None
+                    v = obj.get(key)
+                    if v is None:
+                        return None
+                    return float(v)
+                except Exception:
+                    return None
+
+            # If mid exists, prefer it for OHLC. Otherwise, build mid-like OHLC from bid/ask averages.
+            if mid:
+                open_price = sf(mid, 'o')
+                high_price = sf(mid, 'h')
+                low_price = sf(mid, 'l')
+                close_price = sf(mid, 'c')
+            else:
+                # Average bid/ask where possible
+                open_b = sf(bid, 'o')
+                open_a = sf(ask, 'o')
+                high_b = sf(bid, 'h')
+                high_a = sf(ask, 'h')
+                low_b = sf(bid, 'l')
+                low_a = sf(ask, 'l')
+                close_b = sf(bid, 'c')
+                close_a = sf(ask, 'c')
+
+                def avg(a, b):
+                    if a is None and b is None:
+                        return None
+                    if a is None:
+                        return b
+                    if b is None:
+                        return a
+                    return (a + b) / 2.0
+
+                open_price = avg(open_b, open_a)
+                high_price = avg(high_b, high_a)
+                low_price = avg(low_b, low_a)
+                close_price = avg(close_b, close_a)
+
+            # Determine bid/ask close prices, falling back to close_price when missing
+            bid_price = sf(bid, 'c') if bid else None
+            ask_price = sf(ask, 'c') if ask else None
+            if bid_price is None and close_price is not None:
+                bid_price = close_price
+            if ask_price is None and close_price is not None:
+                ask_price = close_price
             
             # Calculate spread in pips (for USD/CAD, 1 pip = 0.0001)
             spread_pips = (ask_price - bid_price) * 10000
@@ -454,15 +497,16 @@ def get_oanda_data(credentials, instrument='USD_CAD', granularity='S5', hours=5,
         print(f"   • Current price: {df['close'].iloc[-1]:.5f}")
         print(f"   • Average spread: {df['spread_pips'].mean():.1f} pips")
         
-        # # Show latest data
+
+        # # Show latest data (disabled by default)
         # print(f"\n📈 LATEST 3 CANDLES:")
         # latest_cols = ['timestamp', 'open', 'high', 'low', 'close', 'bid', 'ask', 'spread_pips']
         # print(df[latest_cols].tail(3).to_string(index=False, float_format='%.5f'))
-        
 
-        # return the dataframe with timestamp and  price columns
-        return df[['timestamp', 'price']]
-    
+        # return the dataframe including bid and ask columns so callers
+        # can publish true historical bid/ask values
+        return df[['timestamp', 'price', 'bid', 'ask']]
+
     except Exception as e:
         print(f"❌ ERROR: {e}")
         return None
