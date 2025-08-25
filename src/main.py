@@ -1,0 +1,332 @@
+"""
+main.py
+
+Entrypoint for the price streaming service. This module exposes the
+PriceStreamer class which manages a connection to Redis, reads
+configuration and streams live prices from a broker implementation.
+
+Run as a script to start a self-contained streamer process.
+"""
+
+import json
+import time
+import redis
+import threading
+import uuid
+import sys
+import os
+from pathlib import Path
+
+import broker
+
+class PriceStreamer:
+    def __init__(self, broker_name):
+        assert broker_name in ['oanda', 'ib', 'alpaca'], "Invalid broker name"
+        self.broker_name = broker_name
+        self.credentials = None
+        self.redis_client = None
+        self.instruments = []
+        self.active_instruments = set()
+        self.price_key_prefix = "price_data:"
+        self.price_index_key = "price_index"
+        # Add TTL configuration
+        self.price_ttl = 2  # Default 2 seconds
+        self.index_ttl = 10  # Default 10 seconds
+        self.load_credentials()
+        self.load_config()
+        self.connect_to_redis()
+        
+    def load_credentials(self):
+        """Load OANDA credentials."""
+        try:
+            with open('config/secrets.json', 'r') as f:
+                self.credentials = json.load(f)[self.broker_name]
+            print("✅ Loaded OANDA credentials successfully")
+        except FileNotFoundError:
+            print("❌ Error: secrets.json not found in config directory")
+            raise
+        except json.JSONDecodeError:
+            print("❌ Error: Invalid JSON in secrets.json")
+            raise
+        print(self.credentials)
+
+    def load_config(self):
+        """Load price streamer configuration."""
+        try:
+            with open('config/main.json', 'r') as f:
+                config = json.load(f)
+                self.instruments = config.get('instruments', ['USD_CAD'])
+                self.active_instruments = set(self.instruments)
+                self.redis_config = config.get('redis', {
+                    'host': 'localhost',
+                    'port': 6379,
+                    'db': 0
+                })
+                # Load TTL configuration
+                ttl_config = config.get('ttl', {})
+                self.price_ttl = ttl_config.get('price_data', 2)  # Default 2 seconds
+                self.index_ttl = ttl_config.get('price_index', 10)  # Default 10 seconds
+            print(f"✅ Loaded config: tracking {len(self.instruments)} instruments")
+            print(f"📊 Instruments: {', '.join(self.instruments)}")
+            print(f"⏱️ TTL - Price data: {self.price_ttl}s, Index: {self.index_ttl}s")
+        except FileNotFoundError:
+            print("⚠️ No config/price.json found, using defaults")
+            self.instruments = ['USD_CAD']
+            self.active_instruments = set(self.instruments)
+            self.redis_config = {'host': 'localhost', 'port': 6379, 'db': 0}
+            # Keep default TTL values
+        except json.JSONDecodeError as e:
+            print(f"❌ Error parsing config/price.json: {e}")
+            raise
+        
+    def connect_to_redis(self):
+        """Connect to Redis with retry logic."""
+        max_redis_retries = 5
+        redis_retry_delay = 2
+        
+        for attempt in range(max_redis_retries):
+            try:
+                self.redis_client = redis.Redis(
+                    host=self.redis_config['host'], 
+                    port=self.redis_config['port'], 
+                    db=self.redis_config['db'], 
+                    socket_connect_timeout=5
+                )
+                # Test connection
+                self.redis_client.ping()
+                
+                # Disable Redis persistence to prevent dump.rdb file creation
+                try:
+                    self.redis_client.config_set('save', '')
+                    print("✅ Disabled Redis persistence (no dump.rdb file)")
+                except Exception as e:
+                    print(f"⚠️ Could not disable Redis persistence: {e}")
+                
+                print("✅ Connected to Redis successfully")
+                return
+            except redis.ConnectionError as e:
+                print(f"❌ Redis connection attempt {attempt + 1}/{max_redis_retries} failed: {e}")
+                if attempt < max_redis_retries - 1:
+                    print(f"⏱️ Retrying Redis connection in {redis_retry_delay} seconds...")
+                    time.sleep(redis_retry_delay)
+                else:
+                    print("❌ Failed to connect to Redis after all attempts")
+                    print("💡 Please ensure Redis is running: redis-server")
+                    raise
+        
+    def add_instrument(self, instrument):
+        """Add a new instrument to stream."""
+        if instrument in self.active_instruments:
+            print(f"⚠️ {instrument} is already being streamed")
+        else:
+            self.active_instruments.add(instrument)
+            if instrument not in self.instruments:
+                self.instruments.append(instrument)
+            print(f"✅ Added {instrument} to active streaming")
+        
+        # Send confirmation back
+        confirmation = {
+            'status': 'success',
+            'message': f'Added {instrument} to streaming',
+            'active_instruments': list(self.active_instruments)
+        }
+        self.redis_client.lpush('price_streamer_responses', json.dumps(confirmation))
+
+    def remove_instrument(self, instrument):
+        """Remove an instrument from streaming."""
+        if instrument not in self.active_instruments:
+            print(f"⚠️ {instrument} is not currently being streamed")
+        else:
+            self.active_instruments.discard(instrument)
+            print(f"🛑 Removed {instrument} from active streaming")
+        
+        # Send confirmation back
+        confirmation = {
+            'status': 'success',
+            'message': f'Removed {instrument} from streaming',
+            'active_instruments': list(self.active_instruments)
+        }
+        self.redis_client.lpush('price_streamer_responses', json.dumps(confirmation))
+
+    def list_active_instruments(self):
+        """List currently active instruments."""
+        active = list(self.active_instruments)
+        print(f"📊 Active instruments: {', '.join(active) if active else 'None'}")
+        
+        # Send response back
+        response = {
+            'status': 'success',
+            'active_instruments': active,
+            'instrument_count': len(self.active_instruments)
+        }
+        self.redis_client.lpush('price_streamer_responses', json.dumps(response))
+
+    def run_price_stream(self):
+        """Stream prices for all instruments using a single OANDA stream."""
+        max_retries = 10
+        retry_count = 0
+        retry_delay = 5
+        
+        while True:
+            try:
+                print(f"🔄 Starting/restarting OANDA price stream (attempt {retry_count + 1})")
+                print(f"📊 Streaming instruments: {', '.join(self.active_instruments)}")
+                
+                # Create single stream for all active instruments
+                instruments_list = list(self.active_instruments)
+                if not instruments_list:
+                    print("⚠️ No active instruments, waiting...")
+                    time.sleep(5)
+                    continue
+                
+                # Convert list to comma-separated string for OANDA API
+                instruments_string = ','.join(instruments_list)
+                print(f"🔗 OANDA stream parameter: {instruments_string}")
+
+                for price in broker.stream_oanda_live_prices(self.credentials, instruments_string):
+                    # Skip heartbeat messages
+                    if price.get('type') == 'HEARTBEAT' or 'heartbeat' in price:
+                        continue
+                    
+                    instrument = price.get('instrument')
+                    
+                    # Skip if no instrument (likely a heartbeat or invalid message)
+                    if not instrument:
+                        continue
+                    
+                    # Only process if instrument is still active
+                    if instrument not in self.active_instruments:
+                        continue
+
+                    # Print price as it comes in
+                    print(f"💰 {instrument}: {price['bid']} at {price['timestamp']}")
+                        
+                    # Publish price data to Redis with TTL
+                    price_data = {
+                        'timestamp': price['timestamp'].isoformat() if hasattr(price['timestamp'], 'isoformat') else str(price['timestamp']),
+                        'bid': price['bid'],
+                        'ask': price['ask'],
+                        'price': price['price'],
+                        'spread_pips': price['spread_pips'],
+                        'instrument': instrument
+                    }
+                    
+                    try:
+                        # Generate unique key for this price message
+                        price_key = f"{self.price_key_prefix}{instrument}:{uuid.uuid4().hex[:8]}"
+                        
+                        # Set the price data with configurable TTL
+                        self.redis_client.setex(price_key, self.price_ttl, json.dumps(price_data))
+                        
+                        # Add to price index (also with TTL to self-cleanup)
+                        self.redis_client.sadd(self.price_index_key, price_key)
+                        self.redis_client.expire(self.price_index_key, self.index_ttl)  # Use configurable TTL
+                        
+                        # Get current queue length (count of active price keys)
+                        queue_length = self.redis_client.scard(self.price_index_key)
+                        
+                        # Clean up expired keys from index
+                        self._cleanup_expired_keys()
+                        
+                        # print(f"📤 Put {instrument} price data (TTL: {self.price_ttl}s, active messages: {queue_length})")
+                        
+                    except redis.ConnectionError:
+                        print(f"❌ Lost Redis connection, attempting to reconnect...")
+                        self.connect_to_redis()
+                        
+                        # Retry the operation
+                        price_key = f"{self.price_key_prefix}{instrument}:{uuid.uuid4().hex[:8]}"
+                        self.redis_client.setex(price_key, self.price_ttl, json.dumps(price_data))
+                        self.redis_client.sadd(self.price_index_key, price_key)
+                        self.redis_client.expire(self.price_index_key, self.index_ttl)
+                        queue_length = self.redis_client.scard(self.price_index_key)
+                        self._cleanup_expired_keys()
+                        print(f"📤 Put {instrument} after reconnect (active messages: {queue_length})")
+
+                    retry_count = 0
+                    retry_delay = 5
+                    
+                print(f"⚠️ Price stream ended. Attempting to reconnect...")
+                retry_count += 1
+                
+            except Exception as e:
+                retry_count += 1
+                print(f"❌ Error in price stream: {e}")
+                print(f"⏱️ Reconnecting in {retry_delay} seconds...")
+            
+            if max_retries > 0 and retry_count >= max_retries:
+                print(f"❌ Failed to connect after {max_retries} attempts. Giving up.")
+                break
+                
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 1.5, 60)
+
+    def _cleanup_expired_keys(self):
+        """Remove expired keys from the price index."""
+        try:
+            # Get all keys in the index
+            price_keys = self.redis_client.smembers(self.price_index_key)
+            expired_keys = []
+            
+            for key_bytes in price_keys:
+                key = key_bytes.decode('utf-8') if isinstance(key_bytes, bytes) else key_bytes
+                # Check if the key still exists (hasn't expired)
+                if not self.redis_client.exists(key):
+                    expired_keys.append(key)
+            
+            # Remove expired keys from index
+            if expired_keys:
+                self.redis_client.srem(self.price_index_key, *expired_keys)
+                
+        except redis.ConnectionError:
+            pass  # Skip cleanup if connection issues
+
+    def run(self):
+        """Start the price streaming service."""
+        print(f"🚀 Starting self-contained price streaming service...")
+        
+        # Clear old price data on startup
+        try:
+            # Clean up any existing price keys and index
+            old_keys = self.redis_client.keys(f"{self.price_key_prefix}*")
+            if old_keys:
+                self.redis_client.delete(*old_keys)
+                print(f"🗑️ Cleared {len(old_keys)} old price keys")
+            
+            # Clear the price index
+            self.redis_client.delete(self.price_index_key)
+            print("✨ Price data cleared and ready")
+            
+        except redis.ConnectionError as e:
+            print(f"❌ Could not clear old price data: {e}")
+        
+        # Start price streaming
+        price_thread = threading.Thread(target=self.run_price_stream, daemon=True)
+        price_thread.start()
+        
+        print("✅ Price streaming service started")
+        print("🎧 Ready for add/remove commands")
+        print(f"⏰ Price messages auto-expire after {self.price_ttl} seconds")
+        
+        # Keep the main thread alive
+        try:
+            while True:
+                time.sleep(30)
+                active_count = self.redis_client.scard(self.price_index_key) if self.redis_client else 0
+                print(f"📈 Streaming {len(self.active_instruments)} instruments: {', '.join(self.active_instruments)}")
+                print(f"📊 Active price messages: {active_count}")
+                        
+        except KeyboardInterrupt:
+            print("\n🛑 Price streamer stopped by user")
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Price Streamer')
+    parser.add_argument('--broker', choices=['oanda', 'ib', 'alpaca'], 
+                       default='oanda', help='Broker to use')
+    
+    args = parser.parse_args()
+    
+    streamer = PriceStreamer(args.broker)
+    streamer.run()

@@ -1,0 +1,18 @@
+{
+  "instruments": [
+    "USD_CAD",
+    "EUR_USD", 
+    "WTICO_USD",
+    "GBP_USD",
+    "USD_JPY"
+  ],
+  "redis": {
+    "host": "localhost",
+    "port": 6379,
+    "db": 0
+  },
+  "ttl": {
+    "price_data": 2,
+    "price_index": 15
+  }
+}
