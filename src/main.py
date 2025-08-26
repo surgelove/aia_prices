@@ -216,11 +216,11 @@ class PriceStreamer:
                     # Publish price data to Redis with TTL
                     price_data = {
                         'timestamp': price['timestamp'].isoformat() if hasattr(price['timestamp'], 'isoformat') else str(price['timestamp']),
+                        'instrument': instrument,
+                        'price': price['price'],
                         'bid': price['bid'],
                         'ask': price['ask'],
-                        'price': price['price'],
-                        'spread_pips': price['spread_pips'],
-                        'instrument': instrument
+                        'spread_pips': price['spread_pips']
                     }
                     
                     try:
