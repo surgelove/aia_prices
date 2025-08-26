@@ -486,10 +486,12 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Price Streamer')
-    parser.add_argument('--broker', choices=['oanda', 'ib', 'alpaca'], 
-                       default='oanda', help='Broker to use')
-    parser.add_argument('--rows', type=int, default=5000, help='Number of historical rows to fetch per instrument')
-    parser.add_argument('--ttl', type=int, default=10, help='TTL (seconds) for price messages and index (default 10)')
+    parser.add_argument('-b', '--broker', choices=['oanda', 'ib', 'alpaca'],
+                        default='oanda', help='Broker to use')
+    parser.add_argument('-r', '--rows', type=int, default=5000,
+                        help='Number of historical rows to fetch per instrument')
+    parser.add_argument('-t', '--ttl', type=int, default=10,
+                        help='TTL (seconds) for price messages and index (default 10)')
     
     args = parser.parse_args()
     

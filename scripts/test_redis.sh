@@ -53,8 +53,8 @@ list_redis_objects() {
     fi
     
     echo ""
-    printf "%-30s %-10s %-20s\n" "KEY" "TYPE" "VALUE/SIZE"
-    printf "%-30s %-10s %-20s\n" "---" "----" "----------"
+    printf "%-30s %-10s %s\n" "KEY" "TYPE" "VALUE/SIZE"
+    printf "%-30s %-10s %s\n" "---" "----" "----------"
     
     # Iterate through each key
     echo "$keys" | while IFS= read -r key; do
@@ -63,11 +63,8 @@ list_redis_objects() {
             
             case "$key_type" in
                 "string")
-                    value=$(redis-cli get "$key" 2>/dev/null | head -c 50)
-                    if [ ${#value} -eq 50 ]; then
-                        value="${value}..."
-                    fi
-                    printf "%-30s %-10s %-20s\n" "$key" "$key_type" "$value"
+                    value=$(redis-cli get "$key" 2>/dev/null)
+                    printf "%-30s %-10s %s\n" "$key" "$key_type" "$value"
                     ;;
                 "list")
                     length=$(redis-cli llen "$key" 2>/dev/null)
@@ -102,7 +99,7 @@ if redis-cli ping &> /dev/null; then
     response=$(redis-cli ping 2>/dev/null)
     if [ "$response" = "PONG" ]; then
         print_success "Redis server is ON and responding"
-        print_status "Redis is running on port 6379"
+        print_status "Redis is running"
         
         # Show Redis info
         echo ""
