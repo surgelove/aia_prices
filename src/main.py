@@ -28,7 +28,7 @@ class PriceStreamer:
         self.redis_client = None
         self.instruments = []
         self.active_instruments = set()
-        self.price_key_prefix = "price_data:"
+        self.price_key_prefix = "prices:"
         self.price_index_key = "price_index"
         # Add TTL configuration
         self.price_ttl = 2  # Default 2 seconds
