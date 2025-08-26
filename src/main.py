@@ -29,10 +29,8 @@ class PriceStreamer:
         self.instruments = []
         self.active_instruments = set()
         self.price_key_prefix = "prices:"
-        self.price_index_key = "price_index"
         # Add TTL configuration
         self.price_ttl = 2  # Default 2 seconds
-        self.index_ttl = 10  # Default 10 seconds
         # CLI override for TTL (if provided)
         self.cli_ttl = ttl
         self.load_credentials()
@@ -42,7 +40,6 @@ class PriceStreamer:
             try:
                 ttl_val = int(self.cli_ttl)
                 self.price_ttl = ttl_val
-                self.index_ttl = ttl_val
                 # historical TTL should match overall TTL unless user specifies otherwise in config
                 self.hist_ttl = ttl_val
             except Exception:
@@ -77,14 +74,13 @@ class PriceStreamer:
                 })
                 # Load TTL configuration
                 ttl_config = config.get('ttl', {})
-                # Default to 10 seconds for all messages per user request
+                # Default to 10 seconds for price messages
                 self.price_ttl = ttl_config.get('price_data', 10)  # Default 10 seconds
-                self.index_ttl = ttl_config.get('price_index', 10)  # Default 10 seconds
                 # TTL for historical price messages (seconds). By default match live TTL
                 self.hist_ttl = ttl_config.get('historical_price_data', 10)
             print(f"✅ Loaded config: tracking {len(self.instruments)} instruments")
             print(f"📊 Instruments: {', '.join(self.instruments)}")
-            print(f"⏱️ TTL - Price data: {self.price_ttl}s, Index: {self.index_ttl}s")
+            print(f"⏱️ TTL - Price data: {self.price_ttl}s")
         except FileNotFoundError:
             print("⚠️ No config/price.json found, using defaults")
             self.instruments = ['USD_CAD']
@@ -233,31 +229,14 @@ class PriceStreamer:
                         
                         # Set the price data with configurable TTL
                         self.redis_client.setex(price_key, self.price_ttl, json.dumps(price_data))
-                        
-                        # Add to price index (also with TTL to self-cleanup)
-                        self.redis_client.sadd(self.price_index_key, price_key)
-                        self.redis_client.expire(self.price_index_key, self.index_ttl)  # Use configurable TTL
-                        
-                        # Get current queue length (count of active price keys)
-                        queue_length = self.redis_client.scard(self.price_index_key)
-                        
-                        # Clean up expired keys from index
-                        self._cleanup_expired_keys()
-                        
-                        # print(f"📤 Put {instrument} price data (TTL: {self.price_ttl}s, active messages: {queue_length})")
-                        
                     except redis.ConnectionError:
                         print(f"❌ Lost Redis connection, attempting to reconnect...")
                         self.connect_to_redis()
                         
-                        # Retry the operation
+                        # Retry the operation: simply store the price key
                         price_key = f"{self.price_key_prefix}{instrument}:{uuid.uuid4().hex[:8]}"
                         self.redis_client.setex(price_key, self.price_ttl, json.dumps(price_data))
-                        self.redis_client.sadd(self.price_index_key, price_key)
-                        self.redis_client.expire(self.price_index_key, self.index_ttl)
-                        queue_length = self.redis_client.scard(self.price_index_key)
-                        self._cleanup_expired_keys()
-                        print(f"📤 Put {instrument} after reconnect (active messages: {queue_length})")
+                        print(f"📤 Put {instrument} after reconnect")
 
                     retry_count = 0
                     retry_delay = 5
@@ -277,25 +256,7 @@ class PriceStreamer:
             time.sleep(retry_delay)
             retry_delay = min(retry_delay * 1.5, 60)
 
-    def _cleanup_expired_keys(self):
-        """Remove expired keys from the price index."""
-        try:
-            # Get all keys in the index
-            price_keys = self.redis_client.smembers(self.price_index_key)
-            expired_keys = []
-            
-            for key_bytes in price_keys:
-                key = key_bytes.decode('utf-8') if isinstance(key_bytes, bytes) else key_bytes
-                # Check if the key still exists (hasn't expired)
-                if not self.redis_client.exists(key):
-                    expired_keys.append(key)
-            
-            # Remove expired keys from index
-            if expired_keys:
-                self.redis_client.srem(self.price_index_key, *expired_keys)
-                
-        except redis.ConnectionError:
-            pass  # Skip cleanup if connection issues
+    # Indexing feature removed: no cleanup helper required
 
     def run(self, rows=5000, granularity='S5'):
         """Start the price streaming service."""
@@ -303,16 +264,12 @@ class PriceStreamer:
         
         # Clear old price data on startup
         try:
-            # Clean up any existing price keys and index
+            # Clean up any existing price keys
             old_keys = self.redis_client.keys(f"{self.price_key_prefix}*")
             if old_keys:
                 self.redis_client.delete(*old_keys)
                 print(f"🗑️ Cleared {len(old_keys)} old price keys")
-            
-            # Clear the price index
-            self.redis_client.delete(self.price_index_key)
             print("✨ Price data cleared and ready")
-            
         except redis.ConnectionError as e:
             print(f"❌ Could not clear old price data: {e}")
         
@@ -333,11 +290,16 @@ class PriceStreamer:
         
         # Keep the main thread alive
         try:
-            while True:
-                time.sleep(30)
-                active_count = self.redis_client.scard(self.price_index_key) if self.redis_client else 0
-                print(f"📈 Streaming {len(self.active_instruments)} instruments: {', '.join(self.active_instruments)}")
-                print(f"📊 Active price messages: {active_count}")
+                while True:
+                    time.sleep(30)
+                    # Count active price message keys by pattern
+                    try:
+                        keys = self.redis_client.keys(f"{self.price_key_prefix}*") if self.redis_client else []
+                        active_count = len(keys)
+                    except Exception:
+                        active_count = 0
+                    print(f"📈 Streaming {len(self.active_instruments)} instruments: {', '.join(self.active_instruments)}")
+                    print(f"📊 Active price messages: {active_count}")
                         
         except KeyboardInterrupt:
             print("\n🛑 Price streamer stopped by user")
@@ -454,16 +416,13 @@ class PriceStreamer:
                         # Store the historical message
                         self.redis_client.setex(price_key, hist_ttl, publish_json)
 
-                        # Verify the key exists before adding to the index to avoid
-                        # dangling set members that point to missing keys.
+                        # Verify the key exists before considering it published
+                        # (avoid counting keys that failed to write)
                         try:
                             stored = self.redis_client.get(price_key)
                         except Exception:
                             stored = None
-
                         if stored is not None:
-                            self.redis_client.sadd(self.price_index_key, price_key)
-                            self.redis_client.expire(self.price_index_key, self.index_ttl)
                             published += 1
                             # Print a small sample for debugging
                             try:
