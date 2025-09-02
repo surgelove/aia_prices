@@ -19,6 +19,10 @@ from pathlib import Path
 import pandas as pd
 
 import broker
+import aia_utilities as au
+
+REDIS_HOST = "localhost"
+REDIS_PORT = 6379
 
 class PriceStreamer:
     def __init__(self, broker_name, ttl=None):
@@ -470,8 +474,14 @@ if __name__ == "__main__":
                         help='Number of historical rows to fetch per instrument')
     parser.add_argument('-t', '--ttl', type=int, default=10,
                         help='TTL (seconds) for price messages and index (default 10)')
-    
+    parser.add_argument('-d', '--db', type=int, default=0,
+                        help='Redis database number (default 0)')
+
     args = parser.parse_args()
-    
+
+    # Clear prices on open
+    r = au.Redis_Utilities(host=REDIS_HOST, port=REDIS_PORT, db=args.db, ttl=args.ttl)
+    r.clear('prices')
+
     streamer = PriceStreamer(args.broker, ttl=args.ttl)
     streamer.run(rows=args.rows)
