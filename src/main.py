@@ -46,6 +46,28 @@ class PriceStreamer:
                 pass
         self.connect_to_redis()
         
+    def format_timestamp(self, ts):
+        """Return timestamp as 'YYYY-MM-DD HH:MM:SS.ffffff' (6 microsecond digits).
+
+        Accepts datetime, pandas.Timestamp, numeric, or ISO string values and
+        returns a consistently formatted string. Falls back to str(ts) on error.
+        """
+        if ts is None:
+            return str(ts)
+        try:
+            # If it's already a string, try to parse reliably with pandas
+            if isinstance(ts, str):
+                parsed = pd.to_datetime(ts)
+                return parsed.strftime('%Y-%m-%d %H:%M:%S.%f')
+            # If it has strftime (datetime / pandas.Timestamp), use it
+            if hasattr(ts, 'strftime'):
+                return ts.strftime('%Y-%m-%d %H:%M:%S.%f')
+            # Fallback to pandas conversion for other types
+            parsed = pd.to_datetime(ts)
+            return parsed.strftime('%Y-%m-%d %H:%M:%S.%f')
+        except Exception:
+            return str(ts)
+
     def load_credentials(self):
         """Load OANDA credentials."""
         try:
@@ -211,17 +233,19 @@ class PriceStreamer:
                         continue
 
                     # Print price as it comes in
-                    print(f"💰 {instrument}: {price['bid']} at {price['timestamp']}")
+                    # print(f"💰 {instrument}: {price['bid']} at {price['timestamp']}")
                         
                     # Publish price data to Redis with TTL
                     price_data = {
-                        'timestamp': price['timestamp'].isoformat() if hasattr(price['timestamp'], 'isoformat') else str(price['timestamp']),
+                        'timestamp': self.format_timestamp(price.get('timestamp')),
                         'instrument': instrument,
                         'price': price['price'],
                         'bid': price['bid'],
                         'ask': price['ask'],
                         'spread_pips': price['spread_pips']
                     }
+
+                    print(price_data)
                     
                     try:
                         # Generate unique key for this price message
@@ -361,45 +385,40 @@ class PriceStreamer:
                     if bid is not None and ask is not None:
                         spread_pips = round((ask - bid) * 10000, 1)
 
-                    # Prepare timestamp for storage (ISO) and for display (match live print)
+                    # Prepare timestamp for storage and display using consistent formatter
                     if ts_val is None or pd.isna(ts_val):
                         ts_iso = str(ts_val)
                         display_ts = str(ts_val)
                     else:
-                        # ISO string for storage
+                        # Use the centralized formatter to ensure 6-digit microseconds
                         try:
-                            ts_iso = ts_val.isoformat() if hasattr(ts_val, 'isoformat') else str(ts_val)
+                            ts_iso = self.format_timestamp(ts_val)
                         except Exception:
                             ts_iso = str(ts_val)
-
-                        # Live printing uses datetime.__str__ (space-separated). Produce same display.
-                        try:
-                            if isinstance(ts_val, str):
-                                # Convert '2025-08-25T12:34:56' -> '2025-08-25 12:34:56'
-                                display_ts = ts_val.replace('T', ' ').replace('Z', '')
-                            else:
-                                display_ts = str(ts_val)
-                        except Exception:
-                            display_ts = str(ts_val)
+                        display_ts = ts_iso
 
                     price_data = {
                         'timestamp': ts_iso,
+                        'instrument': instrument,
+                        'price': price,
                         'bid': bid,
                         'ask': ask,
-                        'price': price,
-                        'spread_pips': spread_pips,
-                        'instrument': instrument
+                        'spread_pips': spread_pips
                     }
 
                     # Print historical data in the same format as live updates
                     # Print using the same layout as live updates with formatting
                     if price_data['bid'] is None:
-                        print(f"💰 {instrument}: <no-bid> at {display_ts}")
+                        ...
+                        # print(f"💰 {instrument}: <no-bid> at {display_ts}")
                     else:
                         try:
-                            print(f"💰 {instrument}: {price_data['bid']:.5f} at {display_ts}")
+                            ...
+                            # print(f"💰 {instrument}: {price_data['bid']:.5f} at {display_ts}")
                         except Exception:
-                            print(f"💰 {instrument}: {price_data['bid']} at {display_ts}")
+                            ...
+                            # print(f"💰 {instrument}: {price_data['bid']} at {display_ts}")
+                    print(price_data)
 
                     try:
                         price_key = f"{self.price_key_prefix}{instrument}:{uuid.uuid4().hex[:8]}"
@@ -411,7 +430,7 @@ class PriceStreamer:
                             publish_json = json.dumps(price_data, ensure_ascii=False)
                         except Exception:
                             publish_json = str(price_data)
-                        print(f"▶ PUBLISH -> {price_key} : {publish_json}")
+                        # print(f"▶ PUBLISH -> {price_key} : {publish_json}")
 
                         # Store the historical message
                         self.redis_client.setex(price_key, hist_ttl, publish_json)
@@ -427,7 +446,7 @@ class PriceStreamer:
                             # Print a small sample for debugging
                             try:
                                 stub = stored.decode('utf-8') if isinstance(stored, (bytes, bytearray)) else str(stored)
-                                print(f"🔍 Stored sample for {price_key}: {stub[:160]}")
+                                # print(f"🔍 Stored sample for {price_key}: {stub[:160]}")
                             except Exception:
                                 pass
                         else:

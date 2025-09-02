@@ -380,10 +380,7 @@ def get_oanda_data(credentials, instrument='USD_CAD', granularity='S5', hours=5,
         
         # Parse JSON response
         data = response.json()
-        print('-----here')
-        print(data)
 
-        
         if 'candles' not in data:
             print("❌ ERROR: No candles data in response")
             print(f"Response: {data}")

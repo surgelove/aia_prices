@@ -4,7 +4,8 @@
     "EUR_USD", 
     "WTICO_USD",
     "GBP_USD",
-    "USD_JPY"
+    "USD_JPY",
+    "XAG_USD"
   ],
   "redis": {
     "host": "localhost",
