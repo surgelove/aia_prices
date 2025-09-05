@@ -249,7 +249,7 @@ class PriceStreamer:
                         'spread_pips': price['spread_pips']
                     }
 
-                    print(price_data)
+                    print(str(price_data)[:120]) 
                     
                     try:
                         # Generate unique key for this price message
@@ -422,7 +422,7 @@ class PriceStreamer:
                         except Exception:
                             ...
                             # print(f"💰 {instrument}: {price_data['bid']} at {display_ts}")
-                    print(price_data)
+                    print(str(price_data)[:120]) 
 
                     try:
                         price_key = f"{self.price_key_prefix}{instrument}:{uuid.uuid4().hex[:8]}"
@@ -468,11 +468,11 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Price Streamer')
-    parser.add_argument('-b', '--broker', choices=['oanda', 'ib', 'alpaca'],
-                        default='oanda', help='Broker to use')
+    parser.add_argument('-b', '--broker', choices=['oanda', 'ib'],
+                        default=None, help='Broker to use')
     parser.add_argument('-r', '--rows', type=int, default=5000,
                         help='Number of historical rows to fetch per instrument')
-    parser.add_argument('-t', '--ttl', type=int, default=10,
+    parser.add_argument('-t', '--ttl', type=int, default=14400,
                         help='TTL (seconds) for price messages and index (default 10)')
     parser.add_argument('-d', '--db', type=int, default=0,
                         help='Redis database number (default 0)')

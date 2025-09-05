@@ -1,11 +1,7 @@
 {
   "instruments": [
     "USD_CAD",
-    "EUR_USD", 
-    "WTICO_USD",
-    "GBP_USD",
-    "USD_JPY",
-    "XAG_USD"
+    "WTICO_USD"
   ],
   "redis": {
     "host": "localhost",

@@ -31,6 +31,9 @@ print_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
 
+# Usage: ./scripts/test_redis.sh [MASK]
+# If MASK is provided it will be passed to redis-cli keys (for example: 'keyname:*:*')
+
 # Check if Redis CLI is installed
 if ! command -v redis-cli &> /dev/null; then
     print_error "Redis CLI is not installed!"
@@ -40,12 +43,21 @@ fi
 
 print_status "Testing Redis connection..."
 
+# optional mask argument (default all keys)
+MASK="${1:-*}"
+if [ "$MASK" = "-h" ] || [ "$MASK" = "--help" ]; then
+    echo "Usage: $0 [MASK]"
+    echo "Example: $0 'prices:WTICO_USD:*'"
+    exit 0
+fi
+
 # Function to list Redis objects
 list_redis_objects() {
     print_status "Current Redis objects:"
     
-    # Get all keys
-    keys=$(redis-cli keys "*" 2>/dev/null)
+    # Get keys matching mask
+    print_status "Listing keys matching mask: $MASK"
+    keys=$(redis-cli keys "$MASK" 2>/dev/null)
     
     if [ -z "$keys" ]; then
         print_info "No keys found in Redis database"
