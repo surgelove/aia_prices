@@ -7,9 +7,5 @@
     "host": "localhost",
     "port": 6379,
     "db": 0
-  },
-  "ttl": {
-    "price_data": 2,
-    "price_index": 15
   }
 }
