@@ -311,13 +311,6 @@ class Redis_Utilities:
             print(f"Fallback trim failed: {e}")
             return None
 
-    def instrumentalize(self, list_to_groupby):
-        # Group the data by the specified list of keys
-        grouped = self.redis_db.xgroup_create(stream_name, "group1", id="0", mkstream=True)
-        for key in list_to_groupby:
-            self.redis_db.xgroup_create(stream_name, key, id="0", mkstream=True)
-        return grouped
-
 class TimeBasedMovement:
 
     def __init__(self, range):
